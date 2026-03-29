@@ -38,12 +38,12 @@ RUN mkdir -p /opt/bsl-ls \
 
 
 # === Final stage ===
-FROM debian:bookworm-slim
+FROM eclipse-temurin:21-jre-jammy
 
 # Install xz-utils first for unpacking s6-overlay, then other packages
 # Also install locales for UTF-8 support (critical for Cyrillic filenames and content)
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends xz-utils ca-certificates openjdk-17-jre-headless procps netcat-openbsd locales \
+  && apt-get install -y --no-install-recommends xz-utils ca-certificates procps netcat-openbsd locales \
   && rm -rf /var/lib/apt/lists/* \
   && sed -i '/ru_RU.UTF-8/s/^# //g' /etc/locale.gen \
   && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen \

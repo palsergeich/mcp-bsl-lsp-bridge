@@ -1,0 +1,10 @@
+#!/bin/sh
+exec 2>&1
+
+echo "Starting MCP HTTP server..."
+echo "HTTP endpoint: ${MCP_HTTP_BIND_ADDR:-:8080}${MCP_HTTP_PATH:-/mcp}"
+
+exec /usr/bin/mcp-lsp-bridge \
+    --transport=streamable-http \
+    --http-addr="${MCP_HTTP_BIND_ADDR:-:8080}" \
+    --http-path="${MCP_HTTP_PATH:-/mcp}"

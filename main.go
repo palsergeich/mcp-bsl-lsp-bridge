@@ -18,8 +18,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"rockerboo/mcp-lsp-bridge/bridge"
@@ -31,6 +33,11 @@ import (
 	"rockerboo/mcp-lsp-bridge/types"
 
 	"github.com/mark3labs/mcp-go/server"
+)
+
+const (
+	transportStdio          = "stdio"
+	transportStreamableHTTP = "streamable-http"
 )
 
 // tryLoadConfig attempts to load configuration from multiple locations with security validation
@@ -103,6 +110,35 @@ func validateCommandLineArgs(confPath, logPath, configDir, logDir string) error 
 	return nil
 }
 
+func createBridgeAndServer(config *lsp.LSPServerConfig) (*bridge.MCPLSPBridge, *server.MCPServer, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get current working directory: %w", err)
+	}
+
+	// In container mode we must anchor workspace operations to the mounted workspace root,
+	// not to the process CWD (often /home/user).
+	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
+	allowedDirs := []string{cwd}
+	if workspaceRoot != "" {
+		allowedDirs = []string{workspaceRoot}
+	}
+
+	bridgeInstance := bridge.NewMCPLSPBridge(config, allowedDirs)
+	mcpServer := mcpserver.SetupMCPServer(bridgeInstance)
+	bridgeInstance.SetServer(mcpServer)
+
+	return bridgeInstance, mcpServer, nil
+}
+
+func connectLanguageServers(bridgeInstance *bridge.MCPLSPBridge) {
+	logger.Info("Connecting to language servers...")
+	if err := bridgeInstance.SyncAutoConnect(); err != nil {
+		logger.Warn("Some language servers failed to connect: " + err.Error())
+	}
+	logger.Info("Language server connections ready.")
+}
+
 func main() {
 	// Initialize directory resolver
 	dirResolver := directories.NewDirectoryResolver("mcp-lsp-bridge", directories.DefaultUserProvider{}, directories.DefaultEnvProvider{}, true)
@@ -129,11 +165,20 @@ func main() {
 
 	var logLevel string
 
+	var transport string
+
+	var httpAddr string
+
+	var httpPath string
+
 	flag.StringVar(&confPath, "config", defaultConfigPath, "Path to LSP configuration file")
 	flag.StringVar(&confPath, "c", defaultConfigPath, "Path to LSP configuration file (short)")
 	flag.StringVar(&logPath, "log-path", "", "Path to log file (overrides config and default)")
 	flag.StringVar(&logPath, "l", "", "Path to log file (short)")
 	flag.StringVar(&logLevel, "log-level", "", "Log level: debug, info, warn, error (overrides config)")
+	flag.StringVar(&transport, "transport", transportStdio, "MCP transport to use: stdio or streamable-http")
+	flag.StringVar(&httpAddr, "http-addr", ":8080", "Listen address for streamable-http transport")
+	flag.StringVar(&httpPath, "http-path", "/mcp", "HTTP path for streamable-http transport")
 	flag.Parse()
 
 	// Validate command line arguments for security
@@ -220,41 +265,54 @@ func main() {
 		defer debugFile.Close()
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		panic("Failed to get current working directory: " + err.Error())
-	}
-
-	// In container mode we must anchor workspace operations to the mounted workspace root,
-	// not to the process CWD (often /home/user).
-	workspaceRoot := os.Getenv("WORKSPACE_ROOT")
-	allowedDirs := []string{cwd}
-	if workspaceRoot != "" {
-		allowedDirs = []string{workspaceRoot}
-	}
-
 	// Create and initialize the bridge
-	bridgeInstance := bridge.NewMCPLSPBridge(config, allowedDirs)
-
-	// Setup MCP server with bridge
-	mcpServer := mcpserver.SetupMCPServer(bridgeInstance)
-
-	// Store the server reference in the bridge
-	bridgeInstance.SetServer(mcpServer)
+	bridgeInstance, mcpServer, err := createBridgeAndServer(config)
+	if err != nil {
+		panic("Failed to create MCP bridge: " + err.Error())
+	}
 
 	// Start auto-connect + warm-up SYNCHRONOUSLY before MCP server starts.
 	// This ensures LSP connections are fully established before stdin processing begins.
 	// Critical for docker exec scenarios where stdin closes immediately after sending a request.
-	logger.Info("Connecting to language servers...")
-	if err := bridgeInstance.SyncAutoConnect(); err != nil {
-		logger.Warn("Some language servers failed to connect: " + err.Error())
-	}
-	logger.Info("Language server connections ready.")
+	connectLanguageServers(bridgeInstance)
 
 	// Start MCP server
 	logger.Info("Starting MCP server...")
 
-	if err := server.ServeStdio(mcpServer); err != nil {
-		logger.Error("MCP server error: " + err.Error())
+	switch transport {
+	case transportStdio:
+		if err := server.ServeStdio(mcpServer); err != nil {
+			logger.Error("MCP server error: " + err.Error())
+		}
+	case transportStreamableHTTP:
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+
+		httpServer := &http.Server{
+			Addr:    httpAddr,
+			Handler: mux,
+		}
+		streamableHTTPServer := server.NewStreamableHTTPServer(
+			mcpServer,
+			server.WithEndpointPath(httpPath),
+			server.WithStreamableHTTPServer(httpServer),
+		)
+		normalizedHTTPPath := "/" + strings.Trim(httpPath, "/")
+		if httpPath == "/" {
+			normalizedHTTPPath = "/"
+		}
+		mux.Handle(normalizedHTTPPath, streamableHTTPServer)
+		if normalizedHTTPPath != httpPath {
+			mux.Handle(httpPath, streamableHTTPServer)
+		}
+		if err := streamableHTTPServer.Start(httpAddr); err != nil {
+			logger.Error("MCP streamable-http server error: " + err.Error())
+		}
+	default:
+		logger.Error("Unsupported transport: " + transport)
+		os.Exit(1)
 	}
 }
